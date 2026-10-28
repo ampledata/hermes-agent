@@ -450,6 +450,15 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
         written = write_backend_code(backend, handle, meta, origin, lambda code: write(code, backend.name))
         if written is not None:
             return written
+    # Owner-allowlisted email codes (agent/vault_backends/email_otp.py): read server-side from the
+    # listed mailbox for this exact origin only; the code never enters the conversation.
+    try:
+        from agent.vault_backends.email_otp import resolve_email_otp
+        email_code = resolve_email_otp(origin)
+    except Exception:
+        email_code = None
+    if email_code:
+        return write(email_code, "email")
     prompt = get_code_prompt_callback()
     if prompt is None or not can_prompt_here():
         return json.dumps({"success": False, "error_type": "prompt_unavailable",

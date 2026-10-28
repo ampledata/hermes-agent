@@ -1,0 +1,8 @@
+rules:
+  - name: caci-supplier
+    origin: https://supplier.caci.com
+    gmail_token_dir: /home/hermes/google-accounts/llc-rw
+    sender: noreply-CACI-P2P@noreply-p2p.caci.com
+    subject_regex: "P2P Verification Code"
+    code_regex: "\\b(\\d{6})\\b"
+    max_age_s: 600
