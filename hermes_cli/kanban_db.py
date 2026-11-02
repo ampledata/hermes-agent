@@ -2820,7 +2820,11 @@ def complete_task(
     handoff_summary = summary if summary is not None else result
     # CARD-GATE-01c: worker completions must carry physical evidence. Human
     # approval out of ``review`` and explicit ``force`` stay exempt.
-    if _gate_enabled() and not force and _task_status(conn, task_id) in ("running", "ready"):
+    if (
+        _gate_enabled() and not force
+        and _task_status(conn, task_id) in ("running", "ready")
+        and _retry_status_for_run(conn, task_id) != "review"  # reviewer runs approve, never re-gate
+    ):
         verdict, gate_detail = _evidence_gate(conn, task_id, metadata=metadata, now=now)
         if verdict != "pass":
             _append_event(conn, task_id, "completion_gated", {
