@@ -38,6 +38,16 @@ class OnePasswordLoginBackend(LoginBackend):
         from agent.secret_scope import get_secret
         env_name = str(self.cfg.get("service_account_token_env") or "OP_SERVICE_ACCOUNT_TOKEN")
         self._service_token = get_secret(env_name, "") or ""
+        # Service accounts must scope `op item get` with --vault; remember each item's vault from `item list`.
+        self._vault_by_item: dict[str, str] = {}
+
+    def _vault_args(self, item_id: str) -> list[str]:
+        if not self._service_token:
+            return []
+        if item_id not in self._vault_by_item:
+            self.list_items()
+        vault = self._vault_by_item.get(item_id)
+        return ["--vault", vault] if vault else []
 
     # ── auth ────────────────────────────────────────────────────────────────
 
@@ -104,6 +114,9 @@ class OnePasswordLoginBackend(LoginBackend):
         raw = json.loads(self._run("item", "list", "--categories", "Login", "--format", "json") or "[]")
         out: list[VaultItemMeta] = []
         for item in raw if isinstance(raw, list) else []:
+            vault = item.get("vault") if isinstance(item.get("vault"), dict) else {}
+            if item.get("id") and vault.get("id"):
+                self._vault_by_item[str(item["id"])] = str(vault["id"])
             urls = [str(u["href"]) for u in item.get("urls") or [] if isinstance(u, dict) and u.get("href")]
             origins = _all_origins(urls)
             if not origins:
@@ -121,12 +134,14 @@ class OnePasswordLoginBackend(LoginBackend):
 
     def resolve_password(self, handle: str) -> str:
         item_id = handle[len(self.prefix):]
-        return self._run("item", "get", item_id, "--fields", "label=password", "--reveal").rstrip("\r\n")
+        return self._run("item", "get", item_id, *self._vault_args(item_id),
+                         "--fields", "label=password", "--reveal").rstrip("\r\n")
 
     def resolve_otp(self, handle: str) -> Optional[str]:
         # `--otp` mints the current TOTP from the item's one-time-password field; items without one error out.
         try:
-            code = self._run("item", "get", handle[len(self.prefix):], "--otp").strip()
+            item_id = handle[len(self.prefix):]
+            code = self._run("item", "get", item_id, *self._vault_args(item_id), "--otp").strip()
         except Exception:
             return None
         return code if code.isdigit() else None
