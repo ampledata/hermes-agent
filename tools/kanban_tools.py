@@ -777,6 +777,19 @@ def _handle_complete(args: dict, **kw) -> str:
                 f"in-flight (no state change). Retry kanban_complete with the same "
                 f"summary/metadata and either drop these ids from created_cards, or pass "
                 f"created_cards=[] to skip the card-claim check entirely.")
+        except kb.CompletionGatedError as gated:
+            # Evidence gate (CARD-GATE-01c). verdict "review": the card is now in
+            # review for a human; the run is over, stop working. verdict "failed":
+            # nothing changed; the worker must produce real artifacts first.
+            if gated.verdict == "review":
+                return tool_error(
+                    f"kanban_complete routed {tid} to REVIEW instead of done: {gated.detail}. "
+                    f"A completion claim this fast with no artifacts is not accepted as done; a "
+                    f"reviewer will decide. Do not retry kanban_complete; end your turn now.")
+            return tool_error(
+                f"kanban_complete refused: {gated.detail}. Your task is still in-flight (no state "
+                f"change). A summary is not evidence: write the deliverable into the workspace "
+                f"(files, commit) and retry kanban_complete, or record a block with kanban block.")
         except kb.EmptyCompletionError as empty_err:
             # Same shape as the card gate: nothing was mutated, the audit event
             # already landed; the worker retries with evidence instead of stalling.
