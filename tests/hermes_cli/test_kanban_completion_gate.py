@@ -71,6 +71,21 @@ class TestCompletionEvidenceGate(unittest.TestCase):
                 kb.complete_task(conn, tid, result="done", expected_run_id=run_id)
             self.assertEqual(cm.exception.verdict, "failed")
 
+    def test_reviewer_run_is_exempt(self):
+        """A review-sourced run (reviewer approving) must not be re-gated into review."""
+        with kbc.connect() as conn:
+            tid, run_id = self._running_task(conn, started_ago=60)
+            with self.assertRaises(kb.CompletionGatedError):
+                kb.complete_task(conn, tid, result="summary only", expected_run_id=run_id)
+            self.assertEqual(kb.get_task(conn, tid).status, "review")
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET worker_pid = NULL, claim_lock = NULL WHERE id = ?", (tid,))
+            kb.claim_review_task(conn, tid)
+            review_run = kb._current_run_id(conn, tid)
+            kbd._set_worker_pid(conn, tid, os.getpid())
+            self.assertTrue(kb.complete_task(conn, tid, result="approved", expected_run_id=review_run))
+            self.assertEqual(kb.get_task(conn, tid).status, "done")
+
     def test_gate_defaults_on_in_worker_context(self):
         with mock.patch.dict(os.environ, {"HERMES_KANBAN_TASK": "t_worker"}, clear=False):
             os.environ.pop("HERMES_KANBAN_EVIDENCE_GATE", None)
