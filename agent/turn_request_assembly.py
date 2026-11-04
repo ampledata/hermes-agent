@@ -131,7 +131,8 @@ def assemble_api_request(
 
     # Ephemeral prefill messages go right after the system prompt, API-call-time only.
     if agent.prefill_messages:
-        sys_offset = 1 if (api_messages and api_messages[0].get("role") == "system") else 0
+        from agent.prompt_order import leading_system_count
+        sys_offset = leading_system_count(api_messages)  # 2 under prompt.static_first
         for idx, pfm in enumerate(agent.prefill_messages):
             # Structural clone: the in-place sanitizers below must not write
             # through into agent.prefill_messages' nested containers.

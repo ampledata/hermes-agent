@@ -1134,6 +1134,11 @@ def build_turn_context(
     from tools.skill_provenance import set_review_attended
     set_review_attended(getattr(agent, "_review_attended", False))
     agent._restore_primary_runtime()
+    # SAIL-01: escalation is turn-scoped. The restore above returned the lane model (the
+    # escalation bind set _fallback_activated); clear strikes and the escalation note.
+    if getattr(agent, "_escalation_ladder", None) is not None:
+        from agent.escalation_ladder import reset_for_new_turn
+        reset_for_new_turn(agent)
     _publish_runtime_main(agent)
     _refresh_mcp_tools_between_turns(agent)
 
@@ -1424,6 +1429,17 @@ def build_api_messages(
     effective_system = active_system_prompt or ""
     if agent.ephemeral_system_prompt:
         effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
-    if effective_system:
+    # SAIL-01 escalation note (set only while escalated): API-time only, never persisted.
+    _esc_note = getattr(agent, "_escalation_note", None)
+    if isinstance(_esc_note, str) and _esc_note:
+        effective_system = (effective_system + "\n\n" + _esc_note).strip()
+    # prompt.static_first (SAIL-01): stable tier alone in messages[0], dynamic tiers in a second
+    # system row, so templates that render tools after messages[0] keep `stable + tools` cached.
+    from agent.prompt_order import static_first_system_messages
+    _sf_rows = static_first_system_messages(
+        agent, active_system_prompt, (agent.ephemeral_system_prompt, _esc_note))
+    if _sf_rows:
+        api_messages = _sf_rows + api_messages
+    elif effective_system:
         api_messages = [{"role": "system", "content": effective_system}] + api_messages
     return api_messages, effective_system

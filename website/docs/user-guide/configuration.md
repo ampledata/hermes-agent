@@ -1479,6 +1479,39 @@ prompt_caching:
 
 The 1h tier writes at 2x the base input price (5m writes at 1.25x) and only pays off when your turns are more than five minutes apart — otherwise every tool result is written at the dearer rate for retention nobody uses. `"auto"` picks the tier per session from who paces it: `1h` for sessions a person types into (CLI, TUI, Desktop, Telegram/Discord/Slack and the other messaging platforms), `5m` for machine-paced ones (subagents, cron, `hermes -q` one-shots, webhooks, Kanban workers, the API server, tool-invoked and batch runs). On an install where interactive sessions are parked and resumed through the day, `auto` cut the interactive cache-write bill by roughly 40% while leaving fan-out subagent spend untouched. Delegated subagents are always clamped to `5m`, whatever the setting.
 
+### Static-first system prompt (local prefix caches)
+
+Chat templates such as Gemma-4 render the first system message and then the tool declarations inside the same system turn. A longest-prefix cache (vLLM, llama.cpp) therefore re-prefills the whole tool block whenever any per-session or per-turn byte in the system prompt changes: the timestamp line, memory, the profile line, a Kanban task brief or the per-turn `ephemeral_system_prompt`.
+
+```yaml
+prompt:
+  static_first: false   # default; true = stable tier alone in messages[0]
+```
+
+With `static_first: true` on a `chat_completions` route, the request carries two system messages: `messages[0]` holds only the stable tier (identity, guidance, coding brief; byte-identical across sessions and profiles on the host) and a second system message right after it carries the context and volatile tiers, the ephemeral prompt and any escalation note. The rendered prefix becomes `stable + tools` on every request. Other API modes (native Anthropic cache layout, Responses, Bedrock, MoA) keep the single concatenated system message. Enable it only for endpoints whose chat template accepts a system message after the first one (Gemma-4 does; some templates reject it).
+
+## Escalation Ladder (local only)
+
+After a run of consecutive failed tool calls the agent can hand the **next** model call to a stronger local model, then drop back as soon as a tool call succeeds. Off by default.
+
+```yaml
+escalation:
+  enabled: false                       # true to arm the ladder
+  strikes: 3                           # consecutive failed tool results that trigger it; 0 disables
+  model: reasoning                     # escalation model (LiteLLM alias)
+  base_url: http://127.0.0.1:4000/v1   # must be local: loopback, RFC1918 or tailnet 100.64.0.0/10
+  api_key_env: LITELLM_MASTER_KEY      # env var holding the key for base_url
+  sticky: false                        # true: stay escalated for the rest of the turn after a success
+```
+
+- A failed tool result is one the display layer already flags as failed: a non-zero `exit_code`, an `error` object/`success: false`, or exception text. Calls blocked by a guardrail never ran and do not count either way. Human approval outcomes (a denied, pending or required approval, returned by the tool as `status: blocked`/`pending_approval` or `user_consent: false`) are a human decision, not a tool failure, and do not count either.
+- On the strike that reaches the threshold, the next request is built on the escalation route (same client swap as a provider fallback) with a one-line system note asking for the root cause and the single corrective command. The agent keeps running.
+- One successful tool result resets the counter and returns to the lane model (unless `sticky`). The next turn always starts on the lane model.
+- `base_url` is checked on every escalation: a host that is not a literal loopback, RFC1918 or tailnet address (or `localhost`) is refused and the agent stays on the lane model. Hostnames are not resolved, so cloud endpoints cannot be configured as an escalation target.
+- Every escalate, de-escalate, refusal or failed bind appends one JSON line (`event`, `session`, `card`, `strikes`, `from`, `to`, `dtg`) to `<HERMES_HOME>/logs/escalations.jsonl`.
+
+Enable it per profile: `hermes --profile <name> config set escalation.enabled true`.
+
 ## Auxiliary Models
 
 Hermes uses "auxiliary" models for side tasks like image analysis, browser screenshot analysis, session-title generation, and context compression. By default (`auxiliary.*.provider: "auto"`), Hermes routes every auxiliary task to your **main chat model** — the same provider/model you picked in `hermes model`. You don't need to configure anything to get started, but be aware that on expensive reasoning models (Opus, MiniMax M2.7, etc.) auxiliary tasks add meaningful cost. If you want cheap-and-fast side tasks regardless of your main model, set `auxiliary.<task>.provider` and `auxiliary.<task>.model` explicitly (for example, Gemini Flash on OpenRouter for vision). (Web extraction is not an auxiliary task: `web_extract` and browser snapshots truncate long content deterministically and store the full text for `read_file` paging — no LLM involved.)
