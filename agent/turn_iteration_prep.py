@@ -155,6 +155,15 @@ def prepare_iteration(
         from agent.nous_wire import apply_pending_wire_switch
         apply_pending_wire_switch(agent)
 
+    # SAIL-01 escalation ladder: a model switch queued by the strike counter (3 consecutive
+    # failed tool results -> local escalation model; one success -> back) lands here too.
+    if getattr(agent, "_escalation_pending", None):
+        from agent.escalation_ladder import apply_pending_route
+        try:
+            apply_pending_route(agent)
+        except Exception:
+            logger.warning("escalation route switch failed; staying on current model", exc_info=True)
+
     # Fire step_callback for gateway hooks (agent:step event).
     if agent.step_callback is not None:
         try:

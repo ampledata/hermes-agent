@@ -152,7 +152,123 @@ def note_tool_outcome(agent: Any, *, is_error: bool, blocked: bool = False) -> N
         agent._escalation_pending = action
 
 
+def _profile_logs_dir():
+    from hermes_constants import get_hermes_home
+    return get_hermes_home() / "logs"
+
+
+def _route_label(model: Any, base_url: Any) -> str:
+    return f"{model or '?'}@{base_url or '?'}"
+
+
+def _log_event(agent: Any, event: str, *, strikes: int, from_route: str, to_route: str, reason: str = "") -> None:
+    record = {
+        "event": event,
+        "session": getattr(agent, "session_id", None),
+        "card": os.environ.get("HERMES_KANBAN_TASK") or None,
+        "strikes": strikes,
+        "from": from_route,
+        "to": to_route,
+        "dtg": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    if reason:
+        record["reason"] = reason
+    try:
+        logs = _profile_logs_dir()
+        logs.mkdir(parents=True, exist_ok=True)
+        with open(logs / "escalations.jsonl", "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, sort_keys=True) + "\n")
+    except Exception:
+        logger.debug("escalations.jsonl write failed", exc_info=True)
+
+
+def _bind_escalation_route(agent: Any, cfg: EscalationConfig):
+    """Swap the agent onto the escalation route via the fallback binder (same client/caps
+    plumbing as a provider fallback; ``_fallback_activated`` makes the next turn restore)."""
+    from agent.route_binding import bind_route_entry
+    entry = {"provider": "custom", "model": cfg.model, "base_url": cfg.base_url, "key_env": cfg.api_key_env}
+    return bind_route_entry(agent, entry, "custom", cfg.model)
+
+
+def _restore_lane_route(agent: Any) -> bool:
+    restore = getattr(agent, "_restore_primary_runtime", None)
+    return bool(restore()) if callable(restore) else False
+
+
+def _escalate(agent: Any, ladder: StrikeLadder) -> None:
+    cfg = ladder.config
+    from_route = _route_label(getattr(agent, "model", None), getattr(agent, "base_url", None))
+    to_route = _route_label(cfg.model, cfg.base_url)
+    strikes = ladder.strikes
+    if getattr(agent, "model", None) == cfg.model and getattr(agent, "base_url", None) == cfg.base_url:
+        ladder.reset()  # the lane already runs on the escalation route: nothing to climb to
+        return
+    if not is_local_base_url(cfg.base_url):
+        logger.warning("Escalation refused: %s is not a local URL (G D2); staying on %s", cfg.base_url, from_route)
+        ladder.reset()
+        _log_event(agent, "refused", strikes=strikes, from_route=from_route, to_route=to_route,
+                   reason="non-local base_url")
+        return
+    try:
+        bound = _bind_escalation_route(agent, cfg)
+    except Exception as exc:  # a failed swap must never stop the agent
+        logger.warning("Escalation to %s failed: %s; staying on %s", to_route, exc, from_route)
+        bound = None
+    if bound is None:
+        ladder.reset()
+        _log_event(agent, "failed", strikes=strikes, from_route=from_route, to_route=to_route,
+                   reason="escalation route unavailable")
+        return
+    agent._escalation_note = ESCALATION_NOTE.format(strikes=strikes)
+    agent._escalation_from_route = from_route
+    logger.info("Escalation ladder: %d consecutive tool failures, %s -> %s", strikes, from_route, to_route)
+    _log_event(agent, "escalate", strikes=strikes, from_route=from_route, to_route=to_route)
+    with suppress(Exception):
+        agent._emit_diagnostic_status(f"Escalation: {strikes} tool failures in a row; next call uses {cfg.model}.")
+
+
+def _deescalate(agent: Any) -> None:
+    from_route = _route_label(getattr(agent, "model", None), getattr(agent, "base_url", None))
+    agent._escalation_note = None
+    restored = False
+    try:
+        restored = _restore_lane_route(agent)
+    except Exception as exc:
+        logger.warning("Escalation de-escalate failed: %s", exc)
+    to_route = _route_label(getattr(agent, "model", None), getattr(agent, "base_url", None))
+    _log_event(agent, "deescalate", strikes=0, from_route=from_route,
+               to_route=to_route if restored else getattr(agent, "_escalation_from_route", to_route),
+               reason="" if restored else "lane restore deferred to next turn")
+
+
+def apply_pending_route(agent: Any) -> None:
+    """Called before the next request is built (nothing in flight): apply a queued switch."""
+    action = getattr(agent, "_escalation_pending", None)
+    agent._escalation_pending = None
+    ladder = getattr(agent, "_escalation_ladder", None)
+    if ladder is None or action is None:
+        return
+    if action == "escalate":
+        _escalate(agent, ladder)
+    elif action == "deescalate":
+        _deescalate(agent)
+
+
+def reset_for_new_turn(agent: Any) -> None:
+    """Turn start (after the primary-runtime restore): clear strikes, note and queued switch."""
+    ladder = getattr(agent, "_escalation_ladder", None)
+    if ladder is not None:
+        ladder.reset()
+    agent._escalation_pending = None
+    agent._escalation_note = None
+
+
+def escalation_note(agent: Any) -> str:
+    note = getattr(agent, "_escalation_note", None)
+    return note if isinstance(note, str) else ""
+
+
 __all__ = [
-    "EscalationConfig", "StrikeLadder", "configure_agent", "is_local_base_url",
-    "load_escalation_config", "note_tool_outcome",
+    "EscalationConfig", "StrikeLadder", "apply_pending_route", "configure_agent", "escalation_note",
+    "is_local_base_url", "load_escalation_config", "note_tool_outcome", "reset_for_new_turn",
 ]
