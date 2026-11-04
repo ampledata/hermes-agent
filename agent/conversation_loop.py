@@ -1249,6 +1249,16 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     sp = getattr(agent, "_cached_system_prompt", None)
     if not isinstance(sp, str) or not sp:
         return active_system_prompt
+    from agent.prompt_order import leading_system_count, static_first_system_messages
+    _esc_note = getattr(agent, "_escalation_note", None)
+    if leading_system_count(api_messages) == 2 and getattr(agent, "_prompt_static_first", False):
+        # prompt.static_first layout: re-split for the new route, or collapse when it no longer applies.
+        rows = static_first_system_messages(agent, sp, (agent.ephemeral_system_prompt, _esc_note))
+        if not rows:
+            parts = [sp, agent.ephemeral_system_prompt, _esc_note]
+            rows = [{"role": "system", "content": "\n\n".join(p.strip() for p in parts if isinstance(p, str) and p.strip())}]
+        api_messages[:2] = rows
+        return sp
     if api_messages and api_messages[0].get("role") == "system":
         effective = (sp + "\n\n" + agent.ephemeral_system_prompt).strip() if agent.ephemeral_system_prompt else sp
         if not _rewrite_system_content_blocks(api_messages[0], effective):
