@@ -174,3 +174,14 @@ def test_strike_counter_wired_into_sequential_executor():
 def test_strike_counter_absent_when_ladder_off():
     agent = _real_agent({})
     assert agent._escalation_ladder is None
+
+
+def test_escalation_config_defaults_match_default_config():
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+    section = DEFAULT_CONFIG["escalation"]
+    assert load_escalation_config(section) == EscalationConfig()  # shipped config keeps the ladder off
+    assert section == {"enabled": False, "strikes": 3, "model": "reasoning",
+                       "base_url": "http://127.0.0.1:4000/v1", "api_key_env": "LITELLM_MASTER_KEY",
+                       "sticky": False}
+    assert is_local_base_url(section["base_url"])
+    assert DEFAULT_CONFIG["prompt"] == {"static_first": False}

@@ -574,6 +574,23 @@ DEFAULT_CONFIG = {
         },
     },
 
+    # SAIL-01 escalation ladder: after `strikes` consecutive failed tool results the NEXT model call
+    # goes to `model` at `base_url` (key from env `api_key_env`); one success returns to the lane
+    # model; the next turn always starts on the lane model. LOCAL ONLY: a base_url that is not
+    # loopback/RFC1918/tailnet is refused. Off unless enabled and strikes > 0.
+    "escalation": {
+        "enabled": False,
+        "strikes": 3,
+        "model": "reasoning",
+        "base_url": "http://127.0.0.1:4000/v1",
+        "api_key_env": "LITELLM_MASTER_KEY",
+        "sticky": False,  # true: stay escalated for the rest of the turn after a success
+    },
+    # static_first: send the stable system tier alone in messages[0] and the dynamic tiers in a
+    # second system message (chat_completions only), so templates that render tools after
+    # messages[0] (Gemma-4) keep `stable + tools` in the prefix cache across turns and sessions.
+    "prompt": {"static_first": False},
+
     "compression": {
         "enabled": True,
         # checkpoint_required: fail closed before lossy compaction unless an active memory provider
