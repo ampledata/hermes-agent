@@ -1086,6 +1086,13 @@ def _commit_tool_result(
     from hermes_cli.observability.shared_metrics_harness import observe_tool_outcome
 
     observe_tool_outcome(agent, function_name, is_error)
+    # SAIL-01 strike counter: consecutive failed results queue an escalation for the NEXT call.
+    if getattr(agent, "_escalation_ladder", None) is not None:
+        from agent.escalation_ladder import note_tool_outcome
+        try:
+            note_tool_outcome(agent, is_error=is_error, blocked=blocked)
+        except Exception:
+            logger.debug("escalation strike counter failed", exc_info=True)
     if observed:
         if not blocked:
             function_result = agent._append_guardrail_observation(

@@ -2478,6 +2478,9 @@ def init_agent(
     _apply_display_config(agent, _agent_cfg, platform)
     _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=memory_manager)
     _apply_agent_section(agent, _agent_cfg)
+    # SAIL-01: local-only escalation ladder (off unless escalation.enabled and strikes > 0).
+    from agent.escalation_ladder import configure_agent as _configure_escalation
+    _configure_escalation(agent, _agent_cfg)
     cs = _parse_compression_config(agent, _agent_cfg)
     _config_context_length, _custom_providers, _effective_context_length, _model_cfg = _resolve_context_length(
         agent, _agent_cfg, base_url
