@@ -2731,12 +2731,18 @@ def _gate_physical_evidence(
                     real.append(rel)
             if real:
                 return True, f"git changes: {len(real)} path(s)"
-    except Exception:
-        pass
+        else:
+            combined = ((out.stderr or "") + (out.stdout or "")).strip().lower()
+            if combined and "not a git repository" not in combined:
+                return False, f"git error: {combined}"
+    except Exception as exc:
+        return False, f"git process error: {exc}"
     newest = 0.0
     for root, dirs, files in os.walk(workspace):
-        dirs[:] = [d for d in dirs if d not in {".git", "node_modules", "__pycache__", ".venv", "venv"}]
+        dirs[:] = [d for d in dirs if d not in {".git", "node_modules", "__pycache__", ".venv", "venv", "poll", "watch"}]
         for fn in files:
+            if fn.endswith(".log"):
+                continue
             fp = os.path.join(root, fn)
             if _gate_runtime_generated(fp, task_id):
                 ignored.add(os.path.relpath(fp, workspace))
