@@ -2604,6 +2604,133 @@ class EmptyCompletionError(ValueError):
         )
 
 
+class CompletionGatedError(ValueError):
+    """``complete_task`` refused by the evidence gate (CARD-GATE-01c). ``verdict``
+    is ``"review"`` (the card was routed to ``review`` instead of ``done``) or
+    ``"failed"`` (no transition; the completion claim carried no evidence).
+    A ``ValueError`` so tool error handlers treat it as recoverable."""
+
+    def __init__(self, task_id: str, verdict: str, detail: str):
+        self.task_id = task_id
+        self.verdict = verdict
+        self.detail = detail
+        super().__init__(f"completion gated ({verdict}): {task_id}: {detail}")
+
+
+_GATE_FAST_COMPLETION_SECONDS = 300.0
+_GATE_MANIFEST_FILES = ("GATE.json", "gate-manifest.json")
+
+
+def _gate_enabled() -> bool:
+    """On by default only inside a dispatched worker (``HERMES_KANBAN_TASK`` set):
+    the gate fences worker self-certification, not operator ``complete`` calls.
+    ``HERMES_KANBAN_EVIDENCE_GATE=1|0`` overrides either way."""
+    override = os.environ.get("HERMES_KANBAN_EVIDENCE_GATE", "").strip().lower()
+    if override:
+        return override not in {"0", "off", "false", "no"}
+    return bool(os.environ.get("HERMES_KANBAN_TASK", "").strip())
+
+
+def _gate_run_elapsed(conn: sqlite3.Connection, task_id: str, now: int) -> Optional[float]:
+    """Seconds since the current run (or worker) started; ``None`` when unknown."""
+    run_id = _current_run_id(conn, task_id)
+    started = None
+    if run_id is not None:
+        row = conn.execute("SELECT started_at FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+        started = row["started_at"] if row else None
+    if started is None:
+        row = conn.execute("SELECT worker_started_at, started_at FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        started = (row["worker_started_at"] or row["started_at"]) if row else None
+    return float(now - int(started)) if started else None
+
+
+def _gate_workspace(conn: sqlite3.Connection, task_id: str) -> Optional[Path]:
+    task = get_task(conn, task_id)
+    if task is None:
+        return None
+    try:
+        from hermes_cli.kanban_db_workspace import resolve_workspace
+        return resolve_workspace(task)
+    except Exception:
+        return Path(task.workspace_path).expanduser() if task.workspace_path else None
+
+
+def _gate_physical_evidence(workspace: Optional[Path], started_at: Optional[float]) -> tuple[bool, str]:
+    """Default evidence when no manifest is declared: git changes (tracked or
+    untracked) in the workspace, or any regular file written since the run
+    started."""
+    if workspace is None or not workspace.is_dir():
+        return False, "no workspace"
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(workspace), "status", "--porcelain", "--untracked-files=all"],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            return True, f"git changes: {len(out.stdout.strip().splitlines())} path(s)"
+    except Exception:
+        pass
+    newest = 0.0
+    for root, dirs, files in os.walk(workspace):
+        dirs[:] = [d for d in dirs if d not in {".git", "node_modules", "__pycache__", ".venv", "venv"}]
+        for fn in files:
+            try:
+                newest = max(newest, os.stat(os.path.join(root, fn)).st_mtime)
+            except OSError:
+                continue
+    if newest and (started_at is None or newest >= started_at - 5):
+        return True, "artifact written during run"
+    return False, "no git changes and no files written during the run"
+
+
+def _gate_manifest(workspace: Optional[Path], metadata: Optional[dict]) -> Optional[dict]:
+    if isinstance(metadata, dict):
+        for key in ("gate_manifest", "manifest"):
+            if isinstance(metadata.get(key), dict):
+                return metadata[key]
+    if workspace is not None:
+        for name in _GATE_MANIFEST_FILES:
+            fp = workspace / name
+            if fp.is_file():
+                try:
+                    return json.loads(fp.read_text(encoding="utf-8"))
+                except Exception as e:
+                    return {"_manifest_error": str(e)}
+    return None
+
+
+def _evidence_gate(
+    conn: sqlite3.Connection, task_id: str, *, metadata: Optional[dict], now: int,
+) -> tuple[str, str]:
+    """``("pass"|"review"|"failed", detail)`` for a worker completion claim.
+
+    Rules (CARD-GATE-01c): a declared manifest (``metadata.gate_manifest`` or
+    ``GATE.json`` in the workspace) is evaluated by :mod:`hermes_cli.kanban_gate`;
+    failing checks -> ``failed``. Without a manifest, physical evidence (git
+    changes or files written during the run) passes; none under
+    ``_GATE_FAST_COMPLETION_SECONDS`` -> ``review`` (fast-completion trap);
+    none after that -> ``failed`` (summary-only)."""
+    elapsed = _gate_run_elapsed(conn, task_id, now)
+    workspace = _gate_workspace(conn, task_id)
+    manifest = _gate_manifest(workspace, metadata)
+    if manifest is not None:
+        if "_manifest_error" in manifest:
+            return "failed", f"gate manifest unreadable: {manifest['_manifest_error']}"
+        from hermes_cli.kanban_gate import evaluate
+        result = evaluate(manifest, str(workspace) if workspace else ".", elapsed_time=elapsed or 0.0, artifact_verified=False)
+        if result.checks and result.passed:
+            return "pass", "manifest checks passed: " + ", ".join(c["name"] for c in result.checks)
+        if result.checks:
+            bad = [f"{c['name']}: {c.get('detail', '')}" for c in result.checks if not c["ok"]]
+            return "failed", "manifest checks failed: " + "; ".join(bad)[:800]
+    ok, why = _gate_physical_evidence(workspace, (now - elapsed) if elapsed is not None else None)
+    if ok:
+        return "pass", why
+    if elapsed is not None and elapsed < _GATE_FAST_COMPLETION_SECONDS:
+        return "review", f"fast completion ({elapsed:.0f}s) with {why}"
+    return "failed", f"summary-only completion: {why}"
+
+
 class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
@@ -2671,6 +2798,24 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     handoff_summary = summary if summary is not None else result
+    # CARD-GATE-01c: worker completions must carry physical evidence. Human
+    # approval out of ``review`` and explicit ``force`` stay exempt.
+    if (
+        _gate_enabled() and not force
+        and _task_status(conn, task_id) in ("running", "ready")
+        and _retry_status_for_run(conn, task_id) != "review"  # reviewer runs approve, never re-gate
+    ):
+        verdict, gate_detail = _evidence_gate(conn, task_id, metadata=metadata, now=now)
+        if verdict != "pass":
+            _append_event(conn, task_id, "completion_gated", {
+                "verdict": verdict, "detail": gate_detail, "summary": (handoff_summary or "")[:500],
+            })
+            if verdict == "review":
+                request_review(
+                    conn, task_id, summary=f"[gate: {gate_detail}] {handoff_summary or ''}".strip(),
+                    metadata=metadata, expected_run_id=expected_run_id,
+                )
+            raise CompletionGatedError(task_id, verdict, gate_detail)
     acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
     if acceptance is False:
         return False
