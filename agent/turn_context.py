@@ -1348,6 +1348,13 @@ def build_api_messages(
     _esc_note = getattr(agent, "_escalation_note", None)
     if isinstance(_esc_note, str) and _esc_note:
         effective_system = (effective_system + "\n\n" + _esc_note).strip()
-    if effective_system:
+    # prompt.static_first (SAIL-01): stable tier alone in messages[0], dynamic tiers in a second
+    # system row, so templates that render tools after messages[0] keep `stable + tools` cached.
+    from agent.prompt_order import static_first_system_messages
+    _sf_rows = static_first_system_messages(
+        agent, active_system_prompt, (agent.ephemeral_system_prompt, _esc_note))
+    if _sf_rows:
+        api_messages = _sf_rows + api_messages
+    elif effective_system:
         api_messages = [{"role": "system", "content": effective_system}] + api_messages
     return api_messages, effective_system
