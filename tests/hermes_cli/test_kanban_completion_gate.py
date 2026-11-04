@@ -1,5 +1,6 @@
 """CARD-GATE-01c-b: complete_task() runs the evidence gate (unittest; pytest absent on brute)."""
 import os
+import subprocess
 import tempfile
 import time
 import unittest
@@ -70,6 +71,89 @@ class TestCompletionEvidenceGate(unittest.TestCase):
             with self.assertRaises(kb.CompletionGatedError) as cm:
                 kb.complete_task(conn, tid, result="done", expected_run_id=run_id)
             self.assertEqual(cm.exception.verdict, "failed")
+
+    # SAIL-01-08: files the kanban runtime writes itself (completion memo,
+    # worker log, board DB) are not worker artifacts.
+    def _auto_memo(self, tid, board="dev"):
+        memo = self.ws / "boards" / board / "attachments" / tid / f"{tid}_memo.md"
+        memo.parent.mkdir(parents=True, exist_ok=True)
+        memo.write_text(f"# {tid} completion memo\n")
+        return memo
+
+    def _git_ws(self, started_ago):
+        subprocess.run(["git", "init", "-q", str(self.ws)], check=True)
+        readme = self.ws / "README.md"
+        readme.write_text("base\n")
+        subprocess.run(["git", "-C", str(self.ws), "add", "README.md"], check=True)
+        subprocess.run(["git", "-C", str(self.ws), "-c", "user.name=t", "-c", "user.email=t@t",
+                        "commit", "-q", "-m", "base"], check=True)
+        old = time.time() - started_ago - 600
+        os.utime(readme, (old, old))
+        return readme
+
+    def test_auto_memo_only_is_refused(self):
+        with kbc.connect() as conn:
+            tid, run_id = self._running_task(conn, started_ago=900)
+            self._auto_memo(tid)
+            with self.assertRaises(kb.CompletionGatedError) as cm:
+                kb.complete_task(conn, tid, result="Done, see memo.", expected_run_id=run_id)
+            self.assertEqual(cm.exception.verdict, "failed")
+            self.assertIn("summary-only", cm.exception.detail)
+            self.assertEqual(kb.get_task(conn, tid).status, "running")
+
+    def test_auto_memo_only_in_git_workspace_is_refused(self):
+        with kbc.connect() as conn:
+            tid, run_id = self._running_task(conn, started_ago=900)
+            self._git_ws(started_ago=900)
+            self._auto_memo(tid)
+            with self.assertRaises(kb.CompletionGatedError) as cm:
+                kb.complete_task(conn, tid, result="Done, see memo.", expected_run_id=run_id)
+            self.assertEqual(cm.exception.verdict, "failed")
+            self.assertEqual(kb.get_task(conn, tid).status, "running")
+
+    def test_runtime_log_and_db_only_is_refused(self):
+        with kbc.connect() as conn:
+            tid, run_id = self._running_task(conn, started_ago=900)
+            board = self.ws / "boards" / "dev"
+            (board / "logs").mkdir(parents=True)
+            (board / "logs" / f"{tid}.log").write_text("worker output\n")
+            for name in ("kanban.db", "kanban.db-wal", "kanban.db.dispatch.lock"):
+                (board / name).write_text("x")
+            self._auto_memo(tid)
+            with self.assertRaises(kb.CompletionGatedError) as cm:
+                kb.complete_task(conn, tid, result="Done.", expected_run_id=run_id)
+            self.assertEqual(cm.exception.verdict, "failed")
+
+    def test_auto_memo_plus_real_file_is_done(self):
+        with kbc.connect() as conn:
+            tid, run_id = self._running_task(conn, started_ago=900)
+            self._auto_memo(tid)
+            (self.ws / "out.txt").write_text("real artifact\n")
+            self.assertTrue(kb.complete_task(conn, tid, result="wrote out.txt", expected_run_id=run_id))
+            self.assertEqual(kb.get_task(conn, tid).status, "done")
+
+    def test_auto_memo_plus_real_git_change_is_done(self):
+        with kbc.connect() as conn:
+            tid, run_id = self._running_task(conn, started_ago=900)
+            readme = self._git_ws(started_ago=900)
+            self._auto_memo(tid)
+            readme.write_text("base\nchanged\n")
+            self.assertTrue(kb.complete_task(conn, tid, result="edited README", expected_run_id=run_id))
+            self.assertEqual(kb.get_task(conn, tid).status, "done")
+
+    def test_real_file_only_is_done_after_fast_window(self):
+        with kbc.connect() as conn:
+            tid, run_id = self._running_task(conn, started_ago=900)
+            (self.ws / "out.txt").write_text("real artifact\n")
+            self.assertTrue(kb.complete_task(conn, tid, result="wrote out.txt", expected_run_id=run_id))
+            self.assertEqual(kb.get_task(conn, tid).status, "done")
+
+    def test_other_tasks_memo_still_counts(self):
+        """Only the completing task's own memo is runtime-generated."""
+        with kbc.connect() as conn:
+            tid, run_id = self._running_task(conn, started_ago=900)
+            self._auto_memo("t_deadbeef")
+            self.assertTrue(kb.complete_task(conn, tid, result="done", expected_run_id=run_id))
 
     def test_reviewer_run_is_exempt(self):
         """A review-sourced run (reviewer approving) must not be re-gated into review."""

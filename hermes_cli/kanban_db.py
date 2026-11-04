@@ -2675,32 +2675,82 @@ def _gate_workspace(conn: sqlite3.Connection, task_id: str) -> Optional[Path]:
         return Path(task.workspace_path).expanduser() if task.workspace_path else None
 
 
-def _gate_physical_evidence(workspace: Optional[Path], started_at: Optional[float]) -> tuple[bool, str]:
+def _gate_runtime_generated(path: str, task_id: Optional[str]) -> bool:
+    """True for files the kanban runtime writes itself around a completion, which
+    are never worker evidence: the task's completion memo
+    (``.../attachments/<task_id>/<task_id>_memo.md``), its worker log
+    (``.../logs/<task_id>.log[.N]``) and the board DB with its sidecars and locks
+    (``kanban.db``, ``-wal``/``-shm``/``-journal``, ``kanban.db.*.lock``)."""
+    p = "/" + path.replace("\\", "/").lstrip("/")
+    name = p.rsplit("/", 1)[-1]
+    if re.fullmatch(r"kanban\.db(?:-wal|-shm|-journal|\.[\w.-]+\.lock)?", name):
+        return True
+    if not task_id:
+        return False
+    tid = re.escape(task_id)
+    return bool(re.search(rf"/attachments/{tid}/{tid}_memo\.md$|/logs/{tid}\.log(?:\.\d+)?$", p))
+
+
+def _gate_git_paths(porcelain_z: str) -> list[str]:
+    """Paths from ``git status --porcelain -z``; rename/copy sources are skipped."""
+    tokens = porcelain_z.split("\0")
+    paths: list[str] = []
+    i = 0
+    while i < len(tokens):
+        entry = tokens[i]
+        i += 1
+        if len(entry) < 4:
+            continue
+        paths.append(entry[3:])
+        if "R" in entry[:2] or "C" in entry[:2]:
+            i += 1  # next token is the original path
+    return paths
+
+
+def _gate_physical_evidence(
+    workspace: Optional[Path], started_at: Optional[float], task_id: Optional[str] = None,
+) -> tuple[bool, str]:
     """Default evidence when no manifest is declared: git changes (tracked or
     untracked) in the workspace, or any regular file written since the run
-    started."""
+    started. Files the kanban runtime generates itself
+    (:func:`_gate_runtime_generated`) never count."""
     if workspace is None or not workspace.is_dir():
         return False, "no workspace"
+    ignored: set[str] = set()
     try:
         out = subprocess.run(
-            ["git", "-C", str(workspace), "status", "--porcelain", "--untracked-files=all"],
+            ["git", "-C", str(workspace), "status", "--porcelain", "-z", "--untracked-files=all"],
             capture_output=True, text=True, timeout=30, check=False,
         )
-        if out.returncode == 0 and out.stdout.strip():
-            return True, f"git changes: {len(out.stdout.strip().splitlines())} path(s)"
+        if out.returncode == 0:
+            real = []
+            for rel in _gate_git_paths(out.stdout):
+                if _gate_runtime_generated(rel, task_id):
+                    ignored.add(rel)
+                else:
+                    real.append(rel)
+            if real:
+                return True, f"git changes: {len(real)} path(s)"
     except Exception:
         pass
     newest = 0.0
     for root, dirs, files in os.walk(workspace):
         dirs[:] = [d for d in dirs if d not in {".git", "node_modules", "__pycache__", ".venv", "venv"}]
         for fn in files:
+            fp = os.path.join(root, fn)
+            if _gate_runtime_generated(fp, task_id):
+                ignored.add(os.path.relpath(fp, workspace))
+                continue
             try:
-                newest = max(newest, os.stat(os.path.join(root, fn)).st_mtime)
+                newest = max(newest, os.stat(fp).st_mtime)
             except OSError:
                 continue
     if newest and (started_at is None or newest >= started_at - 5):
         return True, "artifact written during run"
-    return False, "no git changes and no files written during the run"
+    why = "no git changes and no files written during the run"
+    if ignored:
+        why += f" (ignored {len(ignored)} kanban runtime-generated file(s))"
+    return False, why
 
 
 def _gate_manifest(workspace: Optional[Path], metadata: Optional[dict]) -> Optional[dict]:
@@ -2743,7 +2793,7 @@ def _evidence_gate(
         if result.checks:
             bad = [f"{c['name']}: {c.get('detail', '')}" for c in result.checks if not c["ok"]]
             return "failed", "manifest checks failed: " + "; ".join(bad)[:800]
-    ok, why = _gate_physical_evidence(workspace, (now - elapsed) if elapsed is not None else None)
+    ok, why = _gate_physical_evidence(workspace, (now - elapsed) if elapsed is not None else None, task_id)
     if ok:
         return "pass", why
     if elapsed is not None and elapsed < _GATE_FAST_COMPLETION_SECONDS:
