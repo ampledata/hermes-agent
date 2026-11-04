@@ -23,6 +23,11 @@ FAIL_EXIT = ("terminal", json.dumps({"output": "boom", "exit_code": 1, "error": 
 FAIL_OBJ = ("read_file", json.dumps({"success": False, "error": "No such file"}))
 FAIL_EXC = ("web_extract", "Error executing tool 'web_extract': ConnectionError")
 OK = ("terminal", json.dumps({"output": "ok", "exit_code": 0}))
+DENIED = ("terminal", json.dumps({"output": "", "exit_code": -1, "error": "Command denied: rm -rf.",
+                                  "status": "blocked", "user_summary": "You denied this command."}))
+PENDING = ("terminal", json.dumps({"output": "", "exit_code": -1, "error": "", "status": "pending_approval",
+                                   "approval_pending": True, "command": "rm -rf /tmp/x"}))
+CONSENT_NO = ("terminal", json.dumps({"error": "denied", "outcome": "denied", "user_consent": False}))
 
 
 def _agent(cfg=ON):
@@ -35,7 +40,7 @@ def _run(agent, *results, blocked=False):
     """Fake tool runner: classify each result like the executor, then count it."""
     for name, result in results:
         failed, _ = _detect_tool_failure(name, result)
-        note_tool_outcome(agent, is_error=failed, blocked=blocked)
+        note_tool_outcome(agent, is_error=failed, blocked=blocked, result=result)
 
 
 def test_strike_defaults_ladder_off():
@@ -185,3 +190,21 @@ def test_escalation_config_defaults_match_default_config():
                        "sticky": False}
     assert is_local_base_url(section["base_url"])
     assert DEFAULT_CONFIG["prompt"] == {"static_first": False}
+
+
+def test_strike_approval_outcomes_do_not_count():
+    """A human 'no' (denied, pending or required approval) is not a model mistake: no strike."""
+    for name, result in (DENIED, PENDING):
+        assert _detect_tool_failure(name, result)[0] is True, "classifier must still flag it as failed"
+    agent = _agent()
+    _run(agent, DENIED, PENDING, CONSENT_NO, DENIED)
+    assert agent._escalation_ladder.strikes == 0
+    assert agent._escalation_pending is None
+
+
+def test_strike_approval_outcome_does_not_reset_real_strikes():
+    agent = _agent()
+    _run(agent, FAIL_EXIT, FAIL_EXIT, DENIED)
+    assert agent._escalation_ladder.strikes == 2
+    _run(agent, FAIL_EXIT)
+    assert agent._escalation_pending is not None
