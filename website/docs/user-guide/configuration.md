@@ -1504,7 +1504,7 @@ escalation:
   sticky: false                        # true: stay escalated for the rest of the turn after a success
 ```
 
-- A failed tool result is one the display layer already flags as failed: a non-zero `exit_code`, an `error` object/`success: false`, or exception text. Calls blocked by a guardrail or approval never ran and do not count either way.
+- A failed tool result is one the display layer already flags as failed: a non-zero `exit_code`, an `error` object/`success: false`, or exception text. Calls blocked by a guardrail never ran and do not count either way. Human approval outcomes (a denied, pending or required approval, returned by the tool as `status: blocked`/`pending_approval` or `user_consent: false`) are a human decision, not a tool failure, and do not count either.
 - On the strike that reaches the threshold, the next request is built on the escalation route (same client swap as a provider fallback) with a one-line system note asking for the root cause and the single corrective command. The agent keeps running.
 - One successful tool result resets the counter and returns to the lane model (unless `sticky`). The next turn always starts on the lane model.
 - `base_url` is checked on every escalation: a host that is not a literal loopback, RFC1918 or tailnet address (or `localhost`) is refused and the agent stays on the lane model. Hostnames are not resolved, so cloud endpoints cannot be configured as an escalation target.

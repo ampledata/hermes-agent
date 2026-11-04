@@ -1106,7 +1106,7 @@ def _commit_tool_result(
     if getattr(agent, "_escalation_ladder", None) is not None:
         from agent.escalation_ladder import note_tool_outcome
         try:
-            note_tool_outcome(agent, is_error=is_error, blocked=blocked)
+            note_tool_outcome(agent, is_error=is_error, blocked=blocked, result=function_result)
         except Exception:
             logger.debug("escalation strike counter failed", exc_info=True)
     if observed:

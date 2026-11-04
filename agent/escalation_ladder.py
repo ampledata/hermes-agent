@@ -142,10 +142,41 @@ def configure_agent(agent: Any, agent_cfg: Mapping[str, Any] | None) -> None:
         logger.warning("escalation.base_url is not a local address; the ladder will refuse to escalate")
 
 
-def note_tool_outcome(agent: Any, *, is_error: bool, blocked: bool = False) -> None:
-    """Count one committed tool result. Blocked calls never ran and do not count either way."""
+_APPROVAL_STATUSES = frozenset({"blocked", "pending_approval", "approval_required"})
+
+
+def is_approval_outcome(result: Any) -> bool:
+    """True when a tool result is a human approval outcome (denied, pending, required).
+
+    Approval payloads come back from inside the dispatched tool as error JSON, so they look like
+    failures to ``_detect_tool_failure``. A human "no" is not a model mistake and must not count
+    as a strike; escalating on it would tell the stronger model to "issue the corrective command".
+    """
+    if not isinstance(result, str) or not result.lstrip().startswith("{"):
+        return False
+    try:
+        payload = json.loads(result)
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("status") in _APPROVAL_STATUSES:
+        return True
+    if payload.get("approval_pending") is True or payload.get("user_consent") is False:
+        return True
+    return False
+
+
+def note_tool_outcome(agent: Any, *, is_error: bool, blocked: bool = False, result: Any = None) -> None:
+    """Count one committed tool result.
+
+    Blocked calls never ran and do not count either way. Approval outcomes (a denied, pending or
+    required human approval) are a human decision, not a tool failure, and do not count either.
+    """
     ladder = getattr(agent, "_escalation_ladder", None)
     if ladder is None or blocked:
+        return
+    if is_error and is_approval_outcome(result):
         return
     action = ladder.record(bool(is_error))
     if action is not None:
