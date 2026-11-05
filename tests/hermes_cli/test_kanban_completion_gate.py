@@ -186,6 +186,53 @@ class TestCompletionEvidenceGate(unittest.TestCase):
                 self.assertTrue(kb.complete_task(conn, tid, result="summary only", expected_run_id=run_id))
                 self.assertEqual(kb.get_task(conn, tid).status, "done")
 
+    def test_broken_repo_no_manifest_refused(self):
+        """A git error other than 'not a git repository' must fail the gate."""
+        with kbc.connect() as conn:
+            tid, run_id = self._running_task(conn, started_ago=60)
+            with mock.patch('subprocess.run') as mocked_run:
+                mocked_run.return_value = mock.Mock(returncode=1, stdout="", stderr="fatal: some other git error")
+                with self.assertRaises(kb.CompletionGatedError) as cm:
+                    kb.complete_task(conn, tid, result="done", expected_run_id=run_id)
+                self.assertNotEqual(cm.exception.verdict, "pass")
+                self.assertIn("git error", cm.exception.detail.lower())
+
+    def test_broken_repo_with_manifest_accepted(self):
+        """Manifest check happens before physical evidence; corrupted git doesn't block a passing manifest."""
+        with kbc.connect() as conn:
+            tid, run_id = self._running_task(conn, started_ago=60)
+            git_dir = self.ws / ".git"
+            git_dir.mkdir()
+            (git_dir / "config").write_text("corrupted content\n")
+            (self.ws / "GATE.json").write_text('{"files":[], "checks":[{"name":"all-done","ok":true}]}')
+            self.assertTrue(kb.complete_task(conn, tid, result="done", expected_run_id=run_id))
+
+    def test_mtime_scan_ignores_noise(self):
+        """*.log, poll/, and watch/ must be ignored by the mtime scan."""
+        with kbc.connect() as conn:
+            tid, run_id = self._running_task(conn, started_ago=900)
+            (self.ws / "test.log").write_text("noise\n")
+            poll_dir = self.ws / "poll"
+            poll_dir.mkdir()
+            (poll_dir / "file.txt").write_text("noise\n")
+            watch_dir = self.ws / "watch"
+            watch_dir.mkdir()
+            (watch_dir / "file.txt").write_text("noise\n")
+            
+            with self.assertRaises(kb.CompletionGatedError) as cm:
+                kb.complete_task(conn, tid, result="done", expected_run_id=run_id)
+            self.assertEqual(cm.exception.verdict, "failed")
+            self.assertIn("summary-only", cm.exception.detail)
+
+    def test_long_summary_still_refused(self):
+        """A long summary without any artifacts must still be refused."""
+        with kbc.connect() as conn:
+            tid, run_id = self._running_task(conn, started_ago=900)
+            long_summary = "Done " * 200 # 1000 chars
+            with self.assertRaises(kb.CompletionGatedError) as cm:
+                kb.complete_task(conn, tid, result=long_summary, expected_run_id=run_id)
+            self.assertEqual(cm.exception.verdict, "failed")
+            self.assertIn("summary-only", cm.exception.detail)
 
 if __name__ == "__main__":
     unittest.main()
