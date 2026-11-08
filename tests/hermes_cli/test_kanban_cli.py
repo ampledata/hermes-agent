@@ -152,6 +152,14 @@ def test_kanban_edit_updates_documented_task_fields(kanban_home):
     assert any(event.kind == "reprioritized" for event in events)
 
 
+def test_kanban_edit_max_runtime_parse_error(kanban_home):
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="test", body="test")
+    output = kc.run_slash(f"edit {task_id} --max-runtime bogus")
+    assert "--max-runtime" in output
+    assert "malformed duration" in output
+
+
 def test_worker_link_preserves_foreign_child_rules(kanban_home, monkeypatch):
     with kbc.connect_closing() as conn:
         worker = kb.create_task(conn, title="worker")
