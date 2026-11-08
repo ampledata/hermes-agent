@@ -3271,10 +3271,11 @@ def edit_task(
     body: Optional[str] = None, priority: Optional[int] = None,
     result: Optional[str] = None, summary: Optional[str] = None,
     metadata: Optional[dict] = None, board: Optional[str] = None,
+    max_runtime_seconds: Optional[int] = None,
 ) -> bool:
     """Edit task fields, optionally backfilling a completed task's result."""
     changed_fields = [
-        field for field, value in (("title", title), ("body", body), ("priority", priority))
+        field for field, value in (("title", title), ("body", body), ("priority", priority), ("max_runtime_seconds", max_runtime_seconds))
         if value is not None
     ]
     with write_txn(conn):
@@ -3283,7 +3284,7 @@ def edit_task(
             return False
         assignments = []
         params = []
-        for field, value in (("title", title), ("body", body), ("priority", priority)):
+        for field, value in (("title", title), ("body", body), ("priority", priority), ("max_runtime_seconds", max_runtime_seconds)):
             if value is not None:
                 assignments.append(f"{field} = ?")
                 params.append(value)

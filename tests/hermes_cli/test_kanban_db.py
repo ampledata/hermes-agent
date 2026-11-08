@@ -2084,3 +2084,27 @@ def test_archive_non_running_task_does_not_attempt_termination(kanban_home):
             (t,),
         ).fetchone()
         assert row is None
+
+
+def test_edit_task_updates_max_runtime(kanban_home):
+    """``edit_task`` must correctly update the ``max_runtime_seconds`` column."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="runtime test", assignee="a")
+        task_before = kb.get_task(conn, t)
+        assert task_before.max_runtime_seconds is None
+
+        # Set it
+        assert kb.edit_task(conn, t, max_runtime_seconds=3600) is True
+        task_after = kb.get_task(conn, t)
+        assert task_after.max_runtime_seconds == 3600
+
+        # Update it
+        assert kb.edit_task(conn, t, max_runtime_seconds=7200) is True
+        task_updated = kb.get_task(conn, t)
+        assert task_updated.max_runtime_seconds == 7200
+
+        # Ensure not overwritten by None
+        assert kb.edit_task(conn, t, title="new title") is True
+        task_final = kb.get_task(conn, t)
+        assert task_final.title == "new title"
+        assert task_final.max_runtime_seconds == 7200
