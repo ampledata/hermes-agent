@@ -29,7 +29,7 @@ class TestKanbanGate(unittest.TestCase):
         manifest = {
             "files": [{"path": "test.txt", "min_words": 1, "min_bytes": 1}]
         }
-        manifest_path = self.create_manifest(manifest)
+        self.create_manifest(manifest)
         
         result = evaluate(manifest, self.workspace)
         self.assertTrue(result.passed)
@@ -38,7 +38,7 @@ class TestKanbanGate(unittest.TestCase):
         manifest = {
             "min_runtime_s": 10.0
         }
-        manifest_path = self.create_manifest(manifest)
+        self.create_manifest(manifest)
         
         result = evaluate(manifest, self.workspace, elapsed_time=5.0)
         self.assertFalse(result.passed)
@@ -48,7 +48,7 @@ class TestKanbanGate(unittest.TestCase):
         manifest = {
             "artifact_verification_required": True
         }
-        manifest_path = self.create_manifest(manifest)
+        self.create_manifest(manifest)
         
         result = evaluate(manifest, self.workspace, elapsed_time=15.0, artifact_verified=False)
         self.assertFalse(result.passed)
@@ -58,7 +58,7 @@ class TestKanbanGate(unittest.TestCase):
         manifest = {
             "artifact_verification_required": True
         }
-        manifest_path = self.create_manifest(manifest)
+        self.create_manifest(manifest)
         
         result = evaluate(manifest, self.workspace, elapsed_time=15.0, artifact_verified=True)
         self.assertTrue(result.passed)
@@ -86,7 +86,7 @@ class TestKanbanGateCLI(unittest.TestCase):
         cmd = [sys.executable, self.script, "t_test", "--workspace", self.d, "--manifest", mp, "--elapsed", str(elapsed)]
         if verified:
             cmd.append("--verified")
-        return subprocess.run(cmd, capture_output=True, text=True).returncode
+        return subprocess.run(cmd, capture_output=True, text=True, check=False).returncode
 
     def test_exit0_artifact_after_5min(self):
         self.assertEqual(self.run_gate({"files": [{"path": "out.txt", "min_bytes": 1}]}, 600), 0)
@@ -108,3 +108,64 @@ class TestKanbanGateCLI(unittest.TestCase):
 
     def test_exit0_under_5min_verified(self):
         self.assertEqual(self.run_gate({"files": [{"path": "out.txt", "min_bytes": 1}]}, 120, verified=True), 0)
+
+
+class TestDevopsGate(unittest.TestCase):
+    def _git(self, *a):
+        subprocess.run(["git", *a], cwd=self.repo, check=True, capture_output=True)
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.repo = os.path.join(self.d, "r")
+        os.mkdir(self.repo)
+        self._git("init", "-q", "-b", "master")
+        self._git("config", "user.email", "t@t")
+        self._git("config", "user.name", "t")
+        open(os.path.join(self.repo, "a.txt"), "w").write("a\n")
+        self._git("add", "a.txt")
+        self._git("commit", "-qm", "base")
+        self._git("checkout", "-qb", "card")
+        self.spec = {"worktree": self.repo, "branch": "card", "base": "master",
+                     "log_dir": os.path.join(self.d, "logs"),
+                     "commands": [{"run": "test -f {tree}/b.txt", "exit": 0}]}
+
+    def tearDown(self):
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def _gate(self):
+        return evaluate({"devops_gate": self.spec}, self.repo)
+
+    def test_pass_when_committed(self):
+        open(os.path.join(self.repo, "b.txt"), "w").write("b\n")
+        self._git("add", "b.txt"); self._git("commit", "-qm", "b")
+        self.assertTrue(self._gate().passed, self._gate().checks)
+
+    def test_uncommitted_refused_names_porcelain(self):
+        open(os.path.join(self.repo, "b.txt"), "w").write("b\n")
+        self._git("add", "b.txt"); self._git("commit", "-qm", "b")
+        open(os.path.join(self.repo, "a.txt"), "w").write("changed\n")
+        r = self._gate()
+        self.assertFalse(r.passed)
+        self.assertIn("porcelain", json.dumps(r.checks))
+
+    def test_check_passes_only_on_uncommitted_file_is_refused(self):
+        open(os.path.join(self.repo, "b.txt"), "w").write("b\n")  # untracked
+        r = self._gate()
+        self.assertFalse(r.passed)
+        self.assertTrue(any("HEAD check" in c["name"] and not c["ok"] for c in r.checks))
+
+    @unittest.skipUnless(shutil.which("gitleaks"), "gitleaks not installed")
+    def test_gitleaks_planted_secret(self):
+        secret = "ghp_" + "aB3dE5gH7jK9mN1pQ3rS5tU7vW9xY1zA3bC5"
+        p = os.path.join(self.repo, "b.txt")
+        open(p, "w").write(f"token = {secret}\n")
+        self._git("add", "b.txt"); self._git("commit", "-qm", "b")
+        r = self._gate()
+        self.assertFalse(r.passed)
+        self.assertIn("gitleaks found", json.dumps(r.checks))
+        self.assertNotIn(secret, json.dumps(r.checks))
+        # remove the secret in a rewritten branch: gate passes
+        self._git("reset", "-q", "--hard", "master")
+        open(p, "w").write("b\n")
+        self._git("add", "b.txt"); self._git("commit", "-qm", "b clean")
+        self.assertTrue(self._gate().passed, self._gate().checks)

@@ -9,17 +9,120 @@ import csv
 from typing import Any, Dict, List, Optional, Tuple
 
 class GateResult:
-    def __init__(self, passed: bool, checks: List[Dict[str, Any]]):
+    def __init__(self, passed: bool, checks: list[dict[str, Any]]):
         self.passed = passed
         self.checks = checks
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "passed": self.passed,
             "checks": self.checks
         }
 
-def evaluate(manifest: Dict[str, Any], workspace: str, elapsed_time: float = 0.0, artifact_verified: bool = False) -> GateResult:
+def _wr(path, text):
+    with open(path, "w") as fh:
+        fh.write(text)
+
+
+def _run(argv, cwd, timeout=300):
+    return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout, check=False)
+
+
+def evaluate_devops_gate(spec: dict[str, Any], log_dir: Optional[str] = None) -> list[dict[str, Any]]:
+    """DEVOPS completion gate (FINISH-LINE-01). Returns check dicts.
+
+    spec keys: worktree (card worktree path), branch (card branch), base
+    (default ``gh/master``), commands (list of {run, exit, timeout_s}; run
+    against a clean checkout of committed HEAD, ``{tree}`` expands to it),
+    gitleaks (binary, default ``gitleaks``). Checks: (a) gitleaks on
+    base..branch, (b) ``git status --porcelain`` empty, (c) command re-run on
+    committed HEAD. A gitleaks hit is reported by rule/file/line only, never
+    the secret, and files nothing.
+    """
+    import shutil
+    import tempfile
+    checks: list[dict[str, Any]] = []
+    wt = spec.get("worktree")
+    branch = spec.get("branch", "HEAD")
+    base = spec.get("base", "gh/master")
+    log_dir = log_dir or tempfile.mkdtemp(prefix="devops-gate-")
+    os.makedirs(log_dir, exist_ok=True)
+    if not wt or not os.path.isdir(wt):
+        return [{"name": "devops_gate: worktree", "ok": False, "detail": f"worktree missing: {wt}"}]
+
+    # (b) committed tree
+    try:
+        p = _run(["git", "status", "--porcelain"], wt)
+        log = os.path.join(log_dir, "porcelain.log")
+        _wr(log, p.stdout + p.stderr)
+        ok = p.returncode == 0 and not p.stdout.strip()
+        detail = "OK" if ok else (
+            f"git status --porcelain not empty (uncommitted work; log {log}): "
+            + "; ".join(p.stdout.strip().splitlines()[:5]) if p.returncode == 0
+            else f"git status --porcelain failed rc={p.returncode} (log {log})")
+    except Exception as e:
+        ok, detail = False, f"git status --porcelain error: {e}"
+    checks.append({"name": "devops_gate: git status --porcelain", "ok": ok, "detail": detail})
+
+    # (a) gitleaks on branch range
+    rng = f"{base}..{branch}"
+    report = os.path.join(log_dir, "gitleaks.json")
+    glog = os.path.join(log_dir, "gitleaks.log")
+    cmd = [spec.get("gitleaks", "gitleaks"), "detect", "--source", wt, "--log-opts", rng,
+           "--no-banner", "--redact", "--report-format", "json", "--report-path", report, "--exit-code", "7"]
+    try:
+        p = _run(cmd, wt)
+        _wr(glog, p.stdout + p.stderr)
+        if p.returncode == 0:
+            ok, detail = True, "OK"
+        elif p.returncode == 7:
+            try:
+                with open(report) as fh:
+                    finds = json.load(fh)
+            except Exception:
+                finds = []
+            names = "; ".join(f"{f.get('RuleID')} {f.get('File')}:{f.get('StartLine')} commit {str(f.get('Commit'))[:8]}"
+                              for f in finds[:5])
+            ok, detail = False, f"gitleaks found {len(finds)} leak(s) in {rng}: {names} (report {report}, log {glog}); no automatic filing, BT files clean-up card"
+        else:
+            ok, detail = False, f"gitleaks error rc={p.returncode} on {rng} (log {glog})"
+    except Exception as e:
+        ok, detail = False, f"gitleaks error: {e}"
+    checks.append({"name": f"devops_gate: gitleaks {rng}", "ok": ok, "detail": detail})
+
+    # (c) re-run card checks on committed HEAD (clean detached checkout)
+    cmds = spec.get("commands", [])
+    if cmds:
+        tree = tempfile.mkdtemp(prefix="devops-gate-head-")
+        added = False
+        try:
+            p = _run(["git", "worktree", "add", "--detach", tree, branch], wt)
+            if p.returncode != 0:
+                raise RuntimeError(f"checkout of {branch} failed: {p.stderr.strip()[:200]}")
+            added = True
+            for i, c in enumerate(cmds):
+                run_cmd = c.get("run", "").replace("{tree}", tree)
+                want = c.get("exit", 0)
+                clog = os.path.join(log_dir, f"check-{i}.log")
+                try:
+                    r = subprocess.run(run_cmd, shell=True, cwd=tree, capture_output=True, text=True,
+                                       timeout=c.get("timeout_s", 120), check=False)
+                    _wr(clog, r.stdout + r.stderr)
+                    ok = r.returncode == want
+                    detail = "OK" if ok else f"exit {r.returncode} != {want} on committed HEAD (log {clog}): {run_cmd[:200]}"
+                except subprocess.TimeoutExpired:
+                    ok, detail = False, f"timeout on committed HEAD: {run_cmd[:200]}"
+                checks.append({"name": f"devops_gate: HEAD check {i}", "ok": ok, "detail": detail})
+        except Exception as e:
+            checks.append({"name": "devops_gate: HEAD checks", "ok": False, "detail": str(e)})
+        finally:
+            if added:
+                _run(["git", "worktree", "remove", "--force", tree], wt)
+            shutil.rmtree(tree, ignore_errors=True)
+    return checks
+
+
+def evaluate(manifest: dict[str, Any], workspace: str, elapsed_time: float = 0.0, artifact_verified: bool = False) -> GateResult:
     checks = []
     passed = True
 
@@ -107,7 +210,7 @@ def evaluate(manifest: Dict[str, Any], workspace: str, elapsed_time: float = 0.0
             detail = "OK"
             
             try:
-                proc = subprocess.run(run_cmd, shell=True, cwd=cwd, capture_output=True, text=True, timeout=timeout_s)
+                proc = subprocess.run(run_cmd, shell=True, cwd=cwd, capture_output=True, text=True, timeout=timeout_s, check=False)
                 if proc.returncode != expected_exit:
                     ok = False
                     detail = f"Exit code {proc.returncode} != {expected_exit}"
@@ -122,6 +225,13 @@ def evaluate(manifest: Dict[str, Any], workspace: str, elapsed_time: float = 0.0
             if not ok:
                 passed = False
 
+    # 3b. DEVOPS completion gate (gitleaks, committed tree, HEAD re-run)
+    if "devops_gate" in manifest:
+        for c in evaluate_devops_gate(manifest["devops_gate"], manifest["devops_gate"].get("log_dir")):
+            checks.append(c)
+            if not c["ok"]:
+                passed = False
+
     # 4. SHA256SUMS Check
     if "sha256sums" in manifest:
         sha_path = os.path.join(workspace, manifest["sha256sums"])
@@ -133,7 +243,7 @@ def evaluate(manifest: Dict[str, Any], workspace: str, elapsed_time: float = 0.0
             detail = "SHA256SUMS file not found"
         else:
             try:
-                result = subprocess.run(["sha256sum", "-c", sha_path], cwd=workspace, capture_output=True, text=True)
+                result = subprocess.run(["sha256sum", "-c", sha_path], cwd=workspace, capture_output=True, text=True, check=False)
                 if result.returncode != 0:
                     ok = False
                     detail = result.stderr.strip() or result.stdout.strip() or "Checksum mismatch"
@@ -216,7 +326,7 @@ def main():
             import yaml
             with open(args.manifest, 'r') as f:
                 manifest = yaml.safe_load(f)
-        except:
+        except Exception:
             print(f"Error loading manifest: {e}", file=sys.stderr)
             sys.exit(1)
 
@@ -242,7 +352,7 @@ def main():
     if args.json:
         print(json.dumps(result.to_dict()))
     else:
-        print(f"Status: PASSED")
+        print("Status: PASSED")
         for c in result.checks:
             status = "OK" if c['ok'] else "FAILED"
             print(f"  [{status}] {c['name']}: {c['detail']}")
