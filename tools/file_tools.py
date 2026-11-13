@@ -870,6 +870,10 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     cross-PROFILE guard it was named for no longer exists).
     """
     # write_file checks the binary-document guard before the mirror guard.
+    if path.endswith('.py') and '\\\"' in content:
+        if '\\\"\\\"\\\"' in content or ('\"' not in content.replace('\\\"', '')):
+            return tool_error("Defect detected: Python source contains backslash-escaped quotes. This is a model-generated escaping error. Re-emit the tool call using raw quotes without backslashes.")
+
     err = (_check_sensitive_path(path, task_id)
            or _check_binary_document_write(path, task_id)
            or _check_protected_instruction_write([path], task_id)
@@ -996,6 +1000,10 @@ def patch_tool(mode: str = "replace", path: str | None = None, old_string: str |
             # Hand the shell layer the RESOLVED targets so both layers agree on
             # which file is edited even when the shell's cwd differs.
             if mode == "replace":
+                if path and new_string and path.endswith('.py') and '\\\"' in new_string:
+                    if '\\\"\\\"\\\"' in new_string or ('\"' not in new_string.replace('\\\"', '')):
+                        return tool_error("Defect detected: Python source contains backslash-escaped quotes. This is a model-generated escaping error. Re-emit the tool call using raw quotes without backslashes.")
+
                 if not path:
                     return tool_error("path required")
                 if old_string is None or new_string is None:
