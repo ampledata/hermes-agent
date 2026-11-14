@@ -423,11 +423,14 @@ def _cmd_list(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
         # Cheap mini-dispatch so list reflects dependencies cleared since the last tick.
         kb.recompute_ready(conn)
-        tasks = kb.list_tasks(
-            conn, assignee=assignee, status=args.status, tenant=args.tenant, session_id=args.session,
-            include_archived=args.archived, order_by=getattr(args, "sort", None),
-            workflow_template_id=args.workflow_template_id, current_step_key=args.current_step_key,
-        )
+        if getattr(args, "needs_info", False):
+            tasks = kb.list_needs_info(conn, assignee=assignee)
+        else:
+            tasks = kb.list_tasks(
+                conn, assignee=assignee, status=args.status, tenant=args.tenant, session_id=args.session,
+                include_archived=args.archived, order_by=getattr(args, "sort", None),
+                workflow_template_id=args.workflow_template_id, current_step_key=args.current_step_key,
+            )
     if _json_out(args, [_task_to_dict(t) for t in tasks]):
         return 0
     # Passive discoverability: only multi-board users see which board this is.
