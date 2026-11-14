@@ -109,6 +109,14 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+# Honest stop (doctrine 7g): a reason starting with this prefix is a typed
+# NEEDS-INFO stop. It is sticky ``needs_input`` and is never a failure, so it
+# is excluded from retry accounting and ``gave_up``.
+NEEDS_INFO_PREFIX = "NEEDS-INFO:"
+
+
+def is_needs_info_reason(reason: Optional[str]) -> bool:
+    return bool(reason) and reason.lstrip().upper().startswith(NEEDS_INFO_PREFIX)
 
 # Same-reason block -> unblock -> re-block cycles before routing to ``triage``.
 # Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
@@ -1450,6 +1458,24 @@ def list_tasks(
         query += f" LIMIT {int(limit)}"
     rows = conn.execute(query, params).fetchall()
     return [Task.from_row(r) for r in rows]
+
+
+def list_needs_info(conn: sqlite3.Connection, *, assignee: Optional[str] = None) -> list[Task]:
+    """Blocked cards whose newest ``blocked`` event is a NEEDS-INFO stop."""
+    out = []
+    for t in list_tasks(conn, assignee=assignee, status="blocked"):
+        row = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'blocked' "
+            "ORDER BY id DESC LIMIT 1", (t.id,)).fetchone()
+        if not row or not row[0]:
+            continue
+        try:
+            payload = json.loads(row[0])
+        except (TypeError, ValueError):
+            continue
+        if payload.get("needs_info") or is_needs_info_reason(payload.get("reason")):
+            out.append(t)
+    return out
 
 
 def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
@@ -3372,6 +3398,9 @@ def block_task(
             })
             return True
         source_status = _retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else "ready"
+        needs_info = is_needs_info_reason(reason)
+        if needs_info:
+            kind = "needs_input"
         requested_kind = kind
         rekind_reason = None
         # ``dependency`` only waits on incomplete parents. A worker filing that
@@ -3385,6 +3414,8 @@ def block_task(
             kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
             prev_recurrences=int(_row_get(cur_row, "block_recurrences") or 0),
         )
+        if needs_info:
+            payload["needs_info"] = True
         if rekind_reason:
             payload["requested_kind"] = requested_kind
             payload["rekind_reason"] = rekind_reason

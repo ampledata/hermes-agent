@@ -239,6 +239,7 @@ _SPECS = [
         _arg("--session",
              help="Filter by originating chat/agent session id (set on tasks created from inside an ACP loop)"),
         _arg("--archived", action="store_true", help="Include archived tasks"),
+        _arg("--needs-info", action="store_true", help="Only blocked cards stopped with NEEDS-INFO:"),
         _json_flag(),
         _arg("--sort", choices=sorted(kb.VALID_SORT_ORDERS.keys()),
              help="Sort order for listed tasks (default: priority)"),
