@@ -751,6 +751,20 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
         )
     requested_resolved = requested.resolve(strict=False)
 
+    # HARNESS-WT-01: an existing directory strictly inside a checkout's working
+    # tree (e.g. <repo>/opsdesk) is not a worktree and must never become a
+    # worker cwd: git sees it as "already part of the repo", no worktree is
+    # created and the worker edits the shared checkout. Refuse loudly.
+    if requested.exists():
+        enclosing = _git_toplevel(requested)
+        if enclosing is not None and _path_key(requested_resolved) != _path_key(enclosing):
+            raise ValueError(
+                f"task {task.id} worktree path {task.workspace_path!r} is a subdirectory "
+                f"of the existing git checkout {str(enclosing)!r}; a worker there would "
+                "write to that checkout, not an isolated worktree. Use the repo root "
+                "(anchors <repo>/.worktrees/<id>) or a not-yet-existing path for a new worktree."
+            )
+
     if requested.exists() and _is_linked_worktree_checkout(requested):
         actual_branch = _git_current_branch(requested)
         if actual_branch == branch_name:
