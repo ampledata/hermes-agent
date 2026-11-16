@@ -363,7 +363,10 @@ class GatewayTurnPersistenceMixin:
         # error, provider 5xx) are different: the session is not oversized, and silently dropping the user
         # message causes severe context loss on retry — the agent forgets what was just asked. Persist the
         # user turn so the conversation is preserved. (#7100)
-        agent_failed_early = bool(agent_result.get("failed"))
+        # A turn interrupted by a newer message (text then photo inside the batching window) is
+        # superseded/merged into the follow-up turn, not failed: no "not processed" notice.
+        superseded = bool(agent_result.get("interrupted") and agent_result.get("interrupt_message"))
+        agent_failed_early = bool(agent_result.get("failed")) and not superseded
         hidden_reasoning_incomplete = _is_gateway_hidden_reasoning_incomplete_turn(agent_result)
         from gateway.run_turn import is_context_overflow_failure_result
         is_context_overflow_failure = is_context_overflow_failure_result(agent_result, len(history))
