@@ -1,4 +1,3 @@
-import pytest
 import time
 import asyncio
 from unittest import IsolatedAsyncioTestCase
@@ -63,10 +62,10 @@ class TestBurstPersistence(IsolatedAsyncioTestCase):
             "failed": False,
         }
         
-        failed_early, hidden, overflow, superseded = self.persistence._hmwa_classify_turn_failure(
+        failed_early, hidden, overflow = self.persistence._hmwa_classify_turn_failure(
             agent_result_superseded, self.prepared.history, self.session_entry
         )
-        self.assertTrue(superseded)
+        self.assertTrue(self.persistence._hmwa_turn_superseded(agent_result_superseded))
         self.assertFalse(failed_early)
         
         self.store.transcript = []
@@ -75,7 +74,7 @@ class TestBurstPersistence(IsolatedAsyncioTestCase):
             agent_result=agent_result_superseded, agent_messages=[], prepared=self.prepared,
             response=None, agent_failed_early=failed_early,
             hidden_reasoning_incomplete=hidden, is_context_overflow_failure=overflow,
-            superseded=superseded,
+            superseded=self.persistence._hmwa_turn_superseded(agent_result_superseded),
         )
         self.assertEqual(len(self.store.transcript), 0)
 
@@ -87,10 +86,10 @@ class TestBurstPersistence(IsolatedAsyncioTestCase):
             "failed": True,
         }
         
-        failed_early, hidden, overflow, superseded = self.persistence._hmwa_classify_turn_failure(
+        failed_early, hidden, overflow = self.persistence._hmwa_classify_turn_failure(
             agent_result_restart, self.prepared.history, self.session_entry
         )
-        self.assertFalse(superseded)
+        self.assertFalse(self.persistence._hmwa_turn_superseded(agent_result_restart))
         self.assertTrue(failed_early)
         
         self.store.transcript = []
@@ -99,7 +98,7 @@ class TestBurstPersistence(IsolatedAsyncioTestCase):
             agent_result=agent_result_restart, agent_messages=[], prepared=self.prepared,
             response=None, agent_failed_early=failed_early,
             hidden_reasoning_incomplete=hidden, is_context_overflow_failure=overflow,
-            superseded=superseded,
+            superseded=self.persistence._hmwa_turn_superseded(agent_result_restart),
         )
         self.assertGreaterEqual(len(self.store.transcript), 1)
         self.persistence._hmwa_close_failed_turn.assert_called()
@@ -109,12 +108,12 @@ class TestBurstPersistence(IsolatedAsyncioTestCase):
         
         # Turn 1: Text (superseded)
         text_result = {"interrupted": True, "interrupt_message": "superseded by a new live turn", "failed": False}
-        f1, h1, o1, s1 = self.persistence._hmwa_classify_turn_failure(text_result, self.prepared.history, self.session_entry)
+        f1, h1, o1 = self.persistence._hmwa_classify_turn_failure(text_result, self.prepared.history, self.session_entry)
         await self.persistence._hmwa_persist_turn_transcript(
             event=self.event, source=MagicMock(platform=None), session_entry=self.session_entry, session_key=self.session_entry.session_key,
             agent_result=text_result, agent_messages=[], prepared=self.prepared,
             response=None, agent_failed_early=f1, hidden_reasoning_incomplete=h1, is_context_overflow_failure=o1,
-            superseded=s1,
+            superseded=self.persistence._hmwa_turn_superseded(text_result),
         )
         
         # Turn 2: Photo (merged)
@@ -124,12 +123,12 @@ class TestBurstPersistence(IsolatedAsyncioTestCase):
             {"role": "assistant", "content": "I see the photo!"}
         ]
         photo_result = {"interrupted": False, "failed": False}
-        f2, h2, o2, s2 = self.persistence._hmwa_classify_turn_failure(photo_result, self.prepared.history, self.session_entry)
+        f2, h2, o2 = self.persistence._hmwa_classify_turn_failure(photo_result, self.prepared.history, self.session_entry)
         await self.persistence._hmwa_persist_turn_transcript(
             event=self.event, source=MagicMock(platform=None), session_entry=self.session_entry, session_key=self.session_entry.session_key,
             agent_result=photo_result, agent_messages=merged_messages, prepared=self.prepared,
             response="I see the photo!", agent_failed_early=f2, hidden_reasoning_incomplete=h2, is_context_overflow_failure=o2,
-            superseded=s2,
+            superseded=self.persistence._hmwa_turn_superseded(photo_result),
         )
         
         user_texts = [entry.get("content") for entry in self.store.transcript if entry.get("role") == "user"]
@@ -139,12 +138,12 @@ class TestBurstPersistence(IsolatedAsyncioTestCase):
         # --- Test (d): Real failure still gets notice ---
         self.store.transcript = []
         fail_result = {"failed": True, "interrupted": False}
-        f3, h3, o3, s3 = self.persistence._hmwa_classify_turn_failure(fail_result, self.prepared.history, self.session_entry)
+        f3, h3, o3 = self.persistence._hmwa_classify_turn_failure(fail_result, self.prepared.history, self.session_entry)
         self.assertTrue(f3)
         await self.persistence._hmwa_persist_turn_transcript(
             event=self.event, source=MagicMock(platform=None), session_entry=self.session_entry, session_key=self.session_entry.session_key,
             agent_result=fail_result, agent_messages=[], prepared=self.prepared,
             response=None, agent_failed_early=f3, hidden_reasoning_incomplete=h3, is_context_overflow_failure=o3,
-            superseded=s3,
+            superseded=self.persistence._hmwa_turn_superseded(fail_result),
         )
         self.persistence._hmwa_close_failed_turn.assert_called()

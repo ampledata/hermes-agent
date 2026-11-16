@@ -347,13 +347,20 @@ class GatewayTurnPersistenceMixin:
             "role": "assistant", "content": notice, "timestamp": time.time(), "display_kind": FAILED_TURN_DISPLAY_KIND,
         })
 
+    @staticmethod
+    def _hmwa_turn_superseded(agent_result) -> bool:
+        """True when a newer live message interrupted this turn (burst); control interrupts excluded."""
+        from gateway.run import _is_control_interrupt_message
+        msg = agent_result.get("interrupt_message")
+        return bool(agent_result.get("interrupted") and msg and not _is_control_interrupt_message(msg))
+
     def _hmwa_classify_turn_failure(self, agent_result, history, session_entry):
         """Classify a finished turn for transcript persistence. Returns
         ``(agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure)``.
 
         Context-overflow failures must NOT persist the user message (session would grow and
         reproduce the failure forever); transient failures (429/timeout/5xx) DO."""
-        from gateway.run import _is_gateway_hidden_reasoning_incomplete_turn, _is_control_interrupt_message
+        from gateway.run import _is_gateway_hidden_reasoning_incomplete_turn
         # Save the full conversation to the transcript, including tool calls. This preserves the complete
         # agent loop (tool_calls, tool results, intermediate reasoning) so sessions can be resumed with full
         # context and transcripts are useful for debugging and training data. IMPORTANT: For
@@ -365,7 +372,7 @@ class GatewayTurnPersistenceMixin:
         # user turn so the conversation is preserved. (#7100)
         # A turn interrupted by a newer message (text then photo inside the batching window) is
         # superseded/merged into the follow-up turn, not failed: no "not processed" notice.
-        superseded = bool(agent_result.get("interrupted") and agent_result.get("interrupt_message") and not _is_control_interrupt_message(agent_result.get("interrupt_message")))
+        superseded = self._hmwa_turn_superseded(agent_result)
         agent_failed_early = bool(agent_result.get("failed")) and not superseded
         hidden_reasoning_incomplete = _is_gateway_hidden_reasoning_incomplete_turn(agent_result)
         from gateway.run_turn import is_context_overflow_failure_result
@@ -385,7 +392,7 @@ class GatewayTurnPersistenceMixin:
                 "Suppressing hidden-reasoning-only incomplete gateway turn for session %s: %s",
                 session_entry.session_id, agent_result.get("error", "processing incomplete"),
             )
-        return agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure, superseded
+        return agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure
 
     async def _hmwa_compression_exhaustion_reset(
         self, agent_result, response, session_entry, session_key, source,
@@ -505,7 +512,8 @@ class GatewayTurnPersistenceMixin:
 
     async def _hmwa_persist_turn_transcript(
         self, *, event, source, session_entry, session_key, agent_result, agent_messages,
-        prepared, response, agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure, superseded,
+        prepared, response, agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure,
+        superseded=False,
     ):
         """Persist this turn to the transcript (session_meta on first turn, user-only on transient
         failure, nothing on context overflow), update last_prompt_tokens, and re-baseline the
