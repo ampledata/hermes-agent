@@ -234,5 +234,47 @@ class TestCompletionEvidenceGate(unittest.TestCase):
             self.assertEqual(cm.exception.verdict, "failed")
             self.assertIn("summary-only", cm.exception.detail)
 
+    # KANBAN-GATE-ATTACH-01: run-968 sequence.
+    def _attach_blob(self, tid, name="verification.txt"):
+        blob = self.ws / "boards" / "devops" / "attachments" / tid / name
+        blob.parent.mkdir(parents=True, exist_ok=True)
+        blob.write_text("NSINGEST-01b Verification: SUCCESS")
+        return blob
+
+    def test_attachment_dir_file_is_not_evidence(self):
+        with kbc.connect() as conn:
+            tid, run_id = self._running_task(conn, started_ago=900)
+            self._attach_blob(tid)
+            with self.assertRaises(kb.CompletionGatedError) as cm:
+                kb.complete_task(conn, tid, result="Verified.", expected_run_id=run_id)
+            self.assertEqual(cm.exception.verdict, "failed")
+            self.assertEqual(kb.get_task(conn, tid).status, "running")
+
+    def test_run968_two_refusals_attach_then_third_complete_is_refused(self):
+        with kbc.connect() as conn:
+            tid, run_id = self._running_task(conn, started_ago=900)
+            for _ in range(2):
+                with self.assertRaises(kb.CompletionGatedError) as cm:
+                    kb.complete_task(conn, tid, result="Verified.", expected_run_id=run_id)
+                self.assertEqual(cm.exception.verdict, "failed")
+            self._attach_blob(tid)
+            with self.assertRaises(kb.CompletionGatedError) as cm:
+                kb.complete_task(conn, tid, result="Verified.", expected_run_id=run_id)
+            self.assertEqual(cm.exception.verdict, "failed")
+            self.assertIn("needs_input", cm.exception.detail)
+            self.assertNotEqual(kb.get_task(conn, tid).status, "done")
+
+    def test_recompletion_after_refusal_with_workspace_file_goes_to_review(self):
+        with kbc.connect() as conn:
+            tid, run_id = self._running_task(conn, started_ago=900)
+            with self.assertRaises(kb.CompletionGatedError):
+                kb.complete_task(conn, tid, result="Done.", expected_run_id=run_id)
+            (self.ws / "receipt.txt").write_text("receipt\n")
+            with self.assertRaises(kb.CompletionGatedError) as cm:
+                kb.complete_task(conn, tid, result="Done.", expected_run_id=run_id)
+            self.assertEqual(cm.exception.verdict, "review")
+            self.assertEqual(kb.get_task(conn, tid).status, "review")
+
+
 if __name__ == "__main__":
     unittest.main()
