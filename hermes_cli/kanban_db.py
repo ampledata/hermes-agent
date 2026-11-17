@@ -2658,7 +2658,7 @@ def _gate_workspace(conn: sqlite3.Connection, task_id: str) -> Optional[Path]:
 def _gate_runtime_generated(path: str, task_id: Optional[str]) -> bool:
     """True for files the kanban runtime writes itself around a completion, which
     are never worker evidence: the task's completion memo
-    (``.../attachments/<task_id>/<task_id>_memo.md``), its worker log
+    (anything under ``.../attachments/<task_id>/``), its worker log
     (``.../logs/<task_id>.log[.N]``) and the board DB with its sidecars and locks
     (``kanban.db``, ``-wal``/``-shm``/``-journal``, ``kanban.db.*.lock``)."""
     p = "/" + path.replace("\\", "/").lstrip("/")
@@ -2668,7 +2668,9 @@ def _gate_runtime_generated(path: str, task_id: Optional[str]) -> bool:
     if not task_id:
         return False
     tid = re.escape(task_id)
-    return bool(re.search(rf"/attachments/{tid}/{tid}_memo\.md$|/logs/{tid}\.log(?:\.\d+)?$", p))
+    # Anything under the card's own attachments dir (memo, kanban_complete/attach
+    # blobs, staged artifacts) is runtime-side output, never proof of work.
+    return bool(re.search(rf"/attachments/{tid}/|/logs/{tid}\.log(?:\.\d+)?$", p))
 
 
 def _gate_git_paths(porcelain_z: str) -> list[str]:
@@ -2739,6 +2741,24 @@ def _gate_physical_evidence(
     return False, why
 
 
+def _gate_prior_refusals(conn: sqlite3.Connection, task_id: str, run_started: Optional[float]) -> int:
+    """Count ``completion_gated`` verdict=failed events since the current run started."""
+    rows = conn.execute(
+        "SELECT payload, created_at FROM task_events WHERE task_id = ? AND kind = 'completion_gated'",
+        (task_id,),
+    ).fetchall()
+    n = 0
+    for r in rows:
+        if run_started is not None and r["created_at"] < int(run_started) - 1:
+            continue
+        try:
+            if json.loads(r["payload"] or "{}").get("verdict") == "failed":
+                n += 1
+        except Exception:
+            continue
+    return n
+
+
 def _gate_manifest(workspace: Optional[Path], metadata: Optional[dict]) -> Optional[dict]:
     if isinstance(metadata, dict):
         for key in ("gate_manifest", "manifest"):
@@ -2780,11 +2800,21 @@ def _evidence_gate(
             bad = [f"{c['name']}: {c.get('detail', '')}" for c in result.checks if not c["ok"]]
             return "failed", "manifest checks failed: " + "; ".join(bad)[:800]
     ok, why = _gate_physical_evidence(workspace, (now - elapsed) if elapsed is not None else None, task_id)
+    refusals = _gate_prior_refusals(conn, task_id, (now - elapsed) if elapsed is not None else None)
+    if ok and refusals:
+        # KANBAN-GATE-ATTACH-01: a worker already refused in this run that then
+        # produces a file is the false-completion pattern (t_ecaa7f16 run 968,
+        # t_8d966d44 run 947). Physical evidence alone no longer closes it.
+        return "review", f"re-completion after {refusals} refused attempt(s); {why}"
     if ok:
         return "pass", why
     if elapsed is not None and elapsed < _GATE_FAST_COMPLETION_SECONDS:
         return "review", f"fast completion ({elapsed:.0f}s) with {why}"
-    return "failed", f"summary-only completion: {why}"
+    detail = f"summary-only completion: {why}"
+    if refusals >= 1:
+        detail += (f"; refused {refusals + 1} times this run: stop retrying and call "
+                   "kanban_block(kind='needs_input') instead of attaching an attestation")
+    return "failed", detail
 
 
 class ArtifactPreservationError(RuntimeError):
