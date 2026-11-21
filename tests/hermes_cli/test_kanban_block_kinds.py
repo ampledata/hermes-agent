@@ -144,7 +144,7 @@ def test_dependency_block_with_terminal_parents_parks_then_escalates(
         # A cron/human unblocks; the worker re-declares the same impossible wait.
         assert kb.unblock_task(conn, child)
         assert kb.claim_task(conn, child, claimer="worker") is not None
-        assert kb.block_task(conn, child, reason="still waiting", kind="dependency")
+        assert kb.block_task(conn, child, reason="waiting on upstream", kind="dependency")
         assert kb.get_task(conn, child).status == "triage"
         loop = [e for e in kb.list_events(conn, child) if e.kind == "block_loop_detected"][-1].payload
         assert loop["recurrences"] == kb.BLOCK_RECURRENCE_LIMIT
@@ -198,3 +198,77 @@ def test_dependency_block_with_open_parent_stays_parked_across_dispatch_tick(
 # ---------------------------------------------------------------------------
 
 
+
+
+# --- triage exit + time-wait accounting (KANBAN-TRIAGE-EXIT-01) ---
+
+def _block_cycle(conn, tid, reason, kind="needs_input"):
+    assert kb.block_task(conn, tid, reason=reason, kind=kind)
+    status = kb.get_task(conn, tid).status
+    return status
+
+
+def test_true_repeat_needs_input_still_routes_to_triage(kanban_home):
+    """Negative control: same reason, no time -> triage at the limit."""
+    conn = kbc.connect()
+    tid = _running_task(conn)
+    assert _block_cycle(conn, tid, "need a decision") == "blocked"
+    assert kb.unblock_task(conn, tid)
+    _make_running_again(conn, tid)
+    assert _block_cycle(conn, tid, "need a decision") == "triage"
+
+
+def test_triage_unblock_returns_to_ready(kanban_home):
+    conn = kbc.connect()
+    tid = _running_task(conn)
+    _block_cycle(conn, tid, "need a decision")
+    kb.unblock_task(conn, tid)
+    _make_running_again(conn, tid)
+    assert _block_cycle(conn, tid, "need a decision") == "triage"
+    assert kb.unblock_task(conn, tid)
+    assert kb.get_task(conn, tid).status == "ready"
+    assert kb.get_task(conn, tid).block_recurrences == 0
+
+
+def test_triage_accepts_schedule_and_complete(kanban_home):
+    conn = kbc.connect()
+    for verb in ("schedule", "complete"):
+        tid = _running_task(conn, title=verb)
+        _block_cycle(conn, tid, "x")
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        assert _block_cycle(conn, tid, "x") == "triage"
+        if verb == "schedule":
+            assert kb.schedule_task(conn, tid, reason="wait")
+            assert kb.get_task(conn, tid).status == "scheduled"
+        else:
+            assert kb.complete_task(conn, tid, result="done", force=True)
+            assert kb.get_task(conn, tid).status == "done"
+
+
+def test_time_block_twice_stays_blocked(kanban_home):
+    conn = kbc.connect()
+    tid = _running_task(conn)
+    reason = "NEEDS Q: SCHEDULED_UNTIL 2026-11-21T10:00-08:00 apply window"
+    for _ in range(3):
+        assert _block_cycle(conn, tid, reason) == "blocked"
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+
+
+def test_wake_at_reason_not_counted(kanban_home):
+    conn = kbc.connect()
+    tid = _running_task(conn)
+    for _ in range(2):
+        assert _block_cycle(conn, tid, "wake at 2026-11-21 10:00 PST") == "blocked"
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+
+
+def test_different_reasons_not_repeats(kanban_home):
+    conn = kbc.connect()
+    tid = _running_task(conn)
+    assert _block_cycle(conn, tid, "need A") == "blocked"
+    kb.unblock_task(conn, tid)
+    _make_running_again(conn, tid)
+    assert _block_cycle(conn, tid, "need B") == "blocked"

@@ -2702,7 +2702,7 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked', 'review')
+                   AND status IN ('running', 'ready', 'blocked', 'review', 'triage')
                 """
         params: tuple = (result, now, task_id)
         if expected_run_id is not None:
@@ -3183,6 +3183,7 @@ def block_task(
         new_status, event_kind, set_sql, params, payload = _route_block(
             kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
             prev_recurrences=int(_row_get(cur_row, "block_recurrences") or 0),
+            prev_reason=_last_block_reason(conn, task_id),
         )
         if rekind_reason:
             payload["requested_kind"] = requested_kind
@@ -3212,9 +3213,36 @@ def block_task(
     return True
 
 
+_TIME_REASON_RE = re.compile(
+    r"SCHEDULED_UNTIL|\bwake\s+(?:at|on|after)\s+\S*\d", re.IGNORECASE,
+)
+
+
+def _reason_has_time(reason: Optional[str]) -> bool:
+    """True when a block reason names a wake time (``SCHEDULED_UNTIL`` or ``wake at <time>``)."""
+    return bool(reason and _TIME_REASON_RE.search(reason))
+
+
+def _norm_reason(reason: Optional[str]) -> str:
+    return " ".join(str(reason or "").lower().split())
+
+
+def _last_block_reason(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Reason on the newest block event, or None when there is none."""
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind IN ('blocked', 'block_loop_detected') ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    reason = _json_dict(_row_get(row, "payload")).get("reason")
+    return reason if isinstance(reason, str) else None
+
+
 def _route_block(
     kind: Optional[str], reason: Optional[str], source_status: str, *,
-    prev_kind: Optional[str], prev_recurrences: int,
+    prev_kind: Optional[str], prev_recurrences: int, prev_reason: Optional[str] = None,
 ) -> tuple[str, str, str, tuple, dict]:
     """``(new_status, event_kind, set_sql, params, payload)`` for :func:`block_task`.
 
@@ -3232,7 +3260,18 @@ def _route_block(
     payload = {"reason": reason, "kind": kind, "source_status": source_status}
     if kind == "dependency":
         return "todo", "dependency_wait", "block_kind    = ?", (kind,), payload
-    recurrences = prev_recurrences + 1 if prev_kind == kind else 1
+    if _reason_has_time(reason):
+        # A wait on a clock is not a loop: keep the counter as it was.
+        recurrences = prev_recurrences if prev_kind == kind else 0
+        set_sql = "block_kind    = ?,\n                       block_recurrences = ?"
+        payload = {"reason": reason, "kind": kind, "recurrences": recurrences,
+                   "source_status": source_status, "time_wait": True}
+        return "blocked", "blocked", set_sql, (kind, recurrences), payload
+    same_reason = (
+        prev_reason is None or reason is None
+        or _norm_reason(prev_reason) == _norm_reason(reason)
+    )
+    recurrences = prev_recurrences + 1 if (prev_kind == kind and same_reason) else 1
     set_sql = "block_kind    = ?,\n                       block_recurrences = ?"
     payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status}
     if recurrences >= BLOCK_RECURRENCE_LIMIT:
@@ -3555,17 +3594,17 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
 
 
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
+    """``blocked``/``scheduled``/``triage`` -> its resumable phase (parent re-gated; ``review``
     when that is where it left off), closing any leaked run first."""
     now = int(time.time())
     with write_txn(conn):
         resume_status = (
             _resume_status_from_events(conn, task_id)
-            if _task_status(conn, task_id) == "blocked"
+            if _task_status(conn, task_id) in ("blocked", "triage")
             else "ready"
         )
         _reclaim_dangling_run(
-            conn, task_id, statuses=("blocked", "scheduled"), now=now,
+            conn, task_id, statuses=("blocked", "scheduled", "triage"), now=now,
             note="invariant recovery on unblock",
         )
         # Re-gate on parent completion before restoring the source phase.
@@ -3580,11 +3619,19 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # unbounded; only complete_task clears them. ``consecutive_failures``
         # (the dispatcher's spawn/crash counter) IS reset — a deliberate unblock
         # is a fresh start for the retry budget.
+        # A triage exit is a human decision: reset the loop memory so the
+        # card is not re-routed to triage by its very next block.
+        was_triage = _task_status(conn, task_id) == "triage"
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
             "consecutive_failures = 0, last_failure_error = NULL "
-            "WHERE id = ? AND status IN ('blocked', 'scheduled')", (new_status, task_id),
+            "WHERE id = ? AND status IN ('blocked', 'scheduled', 'triage')", (new_status, task_id),
         )
+        if cur.rowcount == 1 and was_triage:
+            conn.execute(
+                "UPDATE tasks SET block_kind = NULL, block_recurrences = 0 WHERE id = ?",
+                (task_id,),
+            )
         if cur.rowcount != 1:
             return False
         _append_event(
@@ -3877,7 +3924,7 @@ def schedule_task(
                    claim_expires= NULL,
                    worker_pid   = NULL
              WHERE id = ?
-               AND status IN ('todo', 'ready', 'running', 'blocked')
+               AND status IN ('todo', 'ready', 'running', 'blocked', 'triage')
         """
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
